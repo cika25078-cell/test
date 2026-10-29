@@ -1,0 +1,343 @@
+
+Open In Colab
+# 🌟 AI搭載型スケジュール管理アプリ (Smart Schedule Assistant)
+
+このアプリは、Gemini APIを活用して以下の機能を実現します：
+1. **自動スケジュール登録**: 「明日15時に美容院」といったテキスト、音声認識（テキスト入力）、または**予定表の写真・スクリーンショット**から、自動でタイトル・日時・内容を抽出して登録します。
+2. **AIスケジュール提案**: 「今週中に3時間確保して勉強がしたい」といった要望に対して、現在のスケジュールを考慮した最適な時間を提案・自動登録します。
+3. **インタラクティブUI**: Colab上でスマートフォン風に操作できるインターフェースを提供します。
+
+# 必要なライブラリのインストール
+!pip install -q google-genai pillow pandas ipywidgets
+     
+## 1. コアロジックとGemini API連携の実装
+スケジュールデータを保持するマネージャーと、Geminiを呼び出してテキスト/画像から構造化されたスケジュールデータを抽出するロジックを実装します。
+
+import json
+from datetime import datetime
+import pandas as pd
+from PIL import Image
+import io
+from google import genai
+from google.genai import types
+from google.colab import userdata
+
+# スケジュールの構造定義
+class ScheduleApp:
+    def __init__(self):
+        self.events = []
+        self.init_ai_client()
+        self.add_sample_data()
+
+    def init_ai_client(self):
+        try:
+            api_key = userdata.get('secret_key')
+            self.client = genai.Client(api_key=api_key)
+            self.ai_enabled = True
+        except Exception as e:
+            print("⚠️ 注意: GOOGLE_API_KEY がシークレットに設定されていないため、AI機能は制限されます。")
+            self.client = None
+            self.ai_enabled = False
+
+    def add_sample_data(self):
+        # テスト用の初期データ
+        self.add_event("週次MTG", "2025-05-12", "10:00", "11:00", "プロジェクト進捗会議")
+        self.add_event("クライアント商談", "2025-05-12", "14:00", "15:30", "提案書のプレゼン")
+        self.add_event("ジムトレーニング", "2025-05-13", "19:00", "20:00", "背中のトレーニング")
+
+    def add_event(self, title, date, start_time, end_time, memo=""):
+        event = {
+            "タイトル": title,
+            "日付": date,
+            "開始時間": start_time,
+            "終了時間": end_time,
+            "メモ": memo
+        }
+        self.events.append(event)
+        # 日時順にソート
+        self.events.sort(key=lambda x: (x["日付"], x["開始時間"]))
+
+    def get_dataframe(self):
+        if not self.events:
+            return pd.DataFrame(columns=["インデックス", "タイトル", "日付", "開始時間", "終了時間", "メモ"])
+        df = pd.DataFrame(self.events)
+        df.index.name = "ID"
+        return df.reset_index()
+
+    def parse_with_ai(self, user_input_text=None, image_bytes=None):
+        """
+        テキストまたは画像からスケジュール情報をJSON形式で抽出します。
+        """
+        if not self.ai_enabled or not self.client:
+            return "AI機能を利用するにはGoogle APIキーの設定が必要です。"
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M (曜日: %A)")
+        prompt = f"""
+        あなたは優秀なスケジュール管理アシスタントです。
+        ユーザーからの入力（テキスト、または画像）から予定の情報を抽出し、以下のJSONスキーマに従って出力してください。
+        複数の予定が検出された場合は、リスト形式ですべて出力してください。
+
+        現在の基準日時: {now}
+
+        【出力フォーマット】
+        ```json
+        [
+          {{
+            "title": "予定のタイトル",
+            "date": "YYYY-MM-DD",
+            "start_time": "HH:MM",
+            "end_time": "HH:MM (不明な場合は開始の1時間後)",
+            "memo": "メモや詳細"
+          }}
+        ]
+        ```
+        余計な解説は一切含めず、純粋なJSON文字列のみを返してください。
+        """
+
+        contents = [prompt]
+        if user_input_text:
+            contents.append(f"ユーザーの入力テキスト: {user_input_text}")
+        if image_bytes:
+            img = Image.open(io.BytesIO(image_bytes))
+            contents.append(img)
+
+        try:
+            response = self.client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=contents
+            )
+            # JSONをパース
+            text = response.text.replace("```json", "").replace("```", "").strip()
+            parsed_events = json.loads(text)
+
+            added_list = []
+            for e in parsed_events:
+                self.add_event(e['title'], e['date'], e['start_time'], e['end_time'], e.get('memo', ''))
+                added_list.append(f"・{e['date']} {e['start_time']}〜{e['end_time']}: {e['title']}")
+
+            return "以下の予定を新しく自動登録しました！\n" + "\n".join(added_list)
+        except Exception as e:
+            return f"エラーが発生しました: {str(e)}"
+
+    def suggest_schedule(self, request_text):
+        """
+        現在の空きスケジュールを考慮して、ユーザーのやりたいことへの具体的な日時を提案します。
+        """
+        if not self.ai_enabled or not self.client:
+            return "AI機能を利用するにはGoogle APIキーの設定が必要です。"
+
+        current_schedules = json.dumps(self.events, ensure_ascii=False)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        prompt = f"""
+        あなたはスケジュール調整のプロフェッショナルです。
+        ユーザーの要望と現在のスケジュールリストを照らし合わせ、最適な予定候補日時を1〜2つ提案してください。
+
+        現在の基準日時: {now}
+        ユーザーの要望: {request_text}
+        現在の予定一覧:
+        {current_schedules}
+
+        【回答ルール】
+        1. 既に埋まっている時間帯（日付、開始〜終了時間）と重ならないように調整してください。
+        2. 提案日時を明確にし、なぜそこが最適かの理由も優しく説明してください。
+        3. 提案を確定させてスケジュールに追加するためのデータを以下のJSONフォーマットで最後の行に含めてください。
+        ```json_proposal
+        {{
+          "title": "提案する予定タイトル",
+          "date": "YYYY-MM-DD",
+          "start_time": "HH:MM",
+          "end_time": "HH:MM",
+          "memo": "自動提案から登録"
+        }}
+        ```
+        """
+
+        try:
+            response = self.client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt
+            )
+            return response.text
+        except Exception as e:
+            return f"エラーが発生しました: {str(e)}"
+     
+## 2. スマートフォン風アプリ画面（インタラクティブUI）の作成
+`ipywidgets`を活用し、テキスト入力・画像アップロード・AI相談を統合した操作パネルを表示します。
+
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+# インスタンス生成
+app = ScheduleApp()
+
+# UIパーツ構築
+output_display = widgets.Output()
+output_ai = widgets.Output()
+
+# 手動登録用フォーム
+manual_title = widgets.Text(placeholder="予定タイトル", description="タイトル:")
+manual_date = widgets.DatePicker(description="日付:", value=datetime.today().date())
+manual_start = widgets.Text(value="13:00", description="開始:")
+manual_end = widgets.Text(value="14:00", description="終了:")
+manual_memo = widgets.Text(placeholder="詳細など", description="メモ:")
+btn_manual_add = widgets.Button(description="手動登録", button_style="info")
+
+# AI自動入力フォーム（テキスト / 音声文字起こし想定）
+ai_text_input = widgets.Textarea(
+    placeholder="例: 明日の午後3時から美容院の予約が入ったよ",
+    description="予定入力:",
+    layout=widgets.Layout(height="70px")
+)
+btn_ai_text_add = widgets.Button(description="AI自動抽出・登録", button_style="success")
+
+# AI画像スケジュール読み込み
+image_upload = widgets.FileUpload(accept='image/*', multiple=False, description="予定表画像をアップ")
+btn_ai_image_add = widgets.Button(description="画像から予定登録", button_style="success")
+
+# AI相談・提案フォーム
+ai_consult_input = widgets.Textarea(
+    placeholder="例: 今週か来週のどこかで2時間空けてプログラミング勉強をしたい",
+    description="AI相談:",
+    layout=widgets.Layout(height="70px")
+)
+btn_ai_consult = widgets.Button(description="AIに相談して予定を計画", button_style="warning")
+
+# 予定削除
+delete_id = widgets.BoundedIntText(min=0, max=1000, value=0, description="削除ID:")
+btn_delete = widgets.Button(description="予定削除", button_style="danger")
+
+# UI更新関数
+def refresh_schedule_view():
+    with output_display:
+        clear_output(wait=True)
+        print("=== 📅 マイ・スケジュール一覧 ===")
+        df = app.get_dataframe()
+        if df.empty:
+            print("現在予定はありません。")
+        else:
+            display(df)
+
+# --- イベントハンドラー ---
+def on_manual_add_clicked(b):
+    if not manual_title.value.strip():
+        return
+    date_str = manual_date.value.strftime("%Y-%m-%d") if manual_date.value else ""
+    app.add_event(
+        manual_title.value.strip(),
+        date_str,
+        manual_start.value.strip(),
+        manual_end.value.strip(),
+        manual_memo.value.strip()
+    )
+    manual_title.value = ""
+    refresh_schedule_view()
+
+def on_ai_text_add_clicked(b):
+    user_text = ai_text_input.value.strip()
+    if not user_text:
+        return
+    with output_ai:
+        clear_output(wait=True)
+        print("AI解析中...")
+        result = app.parse_with_ai(user_input_text=user_text)
+        print(result)
+    ai_text_input.value = ""
+    refresh_schedule_view()
+
+def on_ai_image_add_clicked(b):
+    if not image_upload.value:
+        with output_ai:
+            print("画像を選択してください。")
+        return
+    uploaded_file = list(image_upload.value.values())[0]
+    content = uploaded_file['content']
+
+    with output_ai:
+        clear_output(wait=True)
+        print("画像を解析して予定を抽出中...")
+        result = app.parse_with_ai(image_bytes=content)
+        print(result)
+    refresh_schedule_view()
+
+def on_ai_consult_clicked(b):
+    request = ai_consult_input.value.strip()
+    if not request:
+        return
+    with output_ai:
+        clear_output(wait=True)
+        print("AIが空き時間を分析して検討中...")
+        result = app.suggest_schedule(request)
+        print(result)
+
+        # 提案JSONがあれば仮保存してパース・自動追加するボタンをダイナミックに提示
+        if "```json_proposal" in result:
+            try:
+                json_part = result.split("```json_proposal")[1].split("```")[0].strip()
+                proposal_data = json.loads(json_part)
+
+                accept_button = widgets.Button(description="この提案をそのままカレンダーに登録", button_style="primary")
+                def on_accept(b):
+                    app.add_event(
+                        proposal_data['title'],
+                        proposal_data['date'],
+                        proposal_data['start_time'],
+                        proposal_data['end_time'],
+                        proposal_data.get('memo', '')
+                    )
+                    with output_ai:
+                        print("👉 提案スケジュールを登録しました！")
+                    refresh_schedule_view()
+                    accept_button.disabled = True
+
+                accept_button.on_click(on_accept)
+                display(accept_button)
+            except Exception:
+                pass
+
+def on_delete_clicked(b):
+    idx = delete_id.value
+    if idx < len(app.events):
+        app.events.pop(idx)
+        app.events.sort(key=lambda x: (x["日付"], x["開始時間"]))
+    refresh_schedule_view()
+
+# ボタンのイベント紐付け
+btn_manual_add.on_click(on_manual_add_clicked)
+btn_ai_text_add.on_click(on_ai_text_add_clicked)
+btn_ai_image_add.on_click(on_ai_image_add_clicked)
+btn_ai_consult.on_click(on_ai_consult_clicked)
+btn_delete.on_click(on_delete_clicked)
+
+# レイアウト設計
+tab = widgets.Tab()
+tab_children = [
+    widgets.VBox([manual_title, manual_date, manual_start, manual_end, manual_memo, btn_manual_add]),
+    widgets.VBox([ai_text_input, btn_ai_text_add]),
+    widgets.VBox([image_upload, btn_ai_image_add]),
+    widgets.VBox([ai_consult_input, btn_ai_consult]),
+    widgets.VBox([delete_id, btn_delete])
+]
+tab.children = tab_children
+tab.set_title(0, '✍️ 手動追加')
+tab.set_title(1, '🗣️ テキスト/音声から追加')
+tab.set_title(2, '📷 画像から追加')
+tab.set_title(3, '💡 AI相談・提案')
+tab.set_title(4, '🗑️ 削除')
+
+# アプリ画面のレンダリング
+app_interface = widgets.VBox([
+    widgets.HTML("📱 スマートスケジュールアシスタント"),
+    tab,
+    widgets.HTML("🕒 AI処理結果"),
+    output_ai,
+    widgets.HTML(""),
+    output_display
+])
+
+display(app_interface)
+refresh_schedule_view()
+     
+
+
+     
